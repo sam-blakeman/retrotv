@@ -1232,6 +1232,7 @@ def draw_pocket(sysname):
     W, H = TALL
     crt = st['era'] == 'crt'
     p = Painter(TALL, (4, 4, 5))
+    controls = {}                 # touch areas exported to params.json
     body = (6, 6, W - 6, H - 6)
     hw = st['hole_w']
     hh = hw / st['aspect']
@@ -1315,8 +1316,10 @@ def draw_pocket(sysname):
         # ---- side thumbwheels (look like they stick out of the case edges)
         wy0 = face[3] + 70
         thumbwheel(p, (W - 62, wy0, W - 4, wy0 + 330), ribs=30)
+        controls['tune'] = (W - 150, wy0 - 20, W, wy0 + 350)
         p.text(W - 82, wy0 + 165, 'TUNING', 'arialbd.ttf', 17, ink_dim, spacing=3, rotate=90)
         thumbwheel(p, (4, wy0 + 30, 62, wy0 + 270), ribs=24)
+        controls['volume'] = (0, wy0 + 10, 150, wy0 + 290)
         p.text(82, wy0 + 150, 'VOLUME', 'arialbd.ttf', 17, ink_dim, spacing=3, rotate=-90)
 
         # ---- control strip: band + power slide switches, brightness knob
@@ -1363,19 +1366,23 @@ def draw_pocket(sysname):
         p.text(500, dy + 78, 'SIGNAL', 'arialbd.ttf', 16, ink_dim, spacing=2, align='l')
         round_button(p, 900, dy + 60, 52, (200, 40, 36), label='POWER', label_col=ink, lpos=(0, 1.6),
                      lsize=18, well_col=(120, 120, 126))
+        controls['power'] = (900 - 80, dy + 60 - 80, 900 + 80, dy + 60 + 110)
         ky = dy + 210
+        key_ids = [['ch_up', 'vol_up', 'tvav'], ['ch_down', 'vol_down', 'menu']]
         keys = [['CH ▲', 'VOL +', 'TV/AV'], ['CH ▼', 'VOL −', 'MENU']]
         for r, row in enumerate(keys):
             for c, lab in enumerate(row):
                 kx = 110 + c * 300
                 kb = (kx, ky + r * 150, kx + 260, ky + r * 150 + 86)
                 push_button(p, kb, (64, 66, 74), r=40, label=lab, label_col=ink, lsize=19)
+                controls[key_ids[r][c]] = (kb[0] - 12, kb[1] - 14, kb[2] + 12, kb[3] + 44)   # incl. label
         # speaker slots
         gy = ky + 340
         gbox = (110, gy, W - 110, gy + 560)
         grille(p, gbox, slots((150, 152, 158), (20, 20, 22), pitch=22, width=10), r=40)
         p.text(cx, gbox[3] + 50, 'POCKET COLOUR TELEVISION', 'arialbd.ttf', 22, ink, spacing=5)
         thumbwheel(p, (W - 50, 1250, W - 4, 1520), col=(70, 70, 76), ribs=26)
+        controls['volume'] = (W - 140, 1230, W, 1540)
         p.text(W - 70, 1385, 'VOLUME', 'arialbd.ttf', 16, ink_dim, spacing=3, rotate=90)
         bot = gbox[3] + 80
 
@@ -1388,7 +1395,7 @@ def draw_pocket(sysname):
         screw(p, sx, H - 80, col=(90, 90, 96) if crt else (150, 150, 156))
 
     p.cut_hole(hole, 26, inner_shadow=0.55, reflection=0.06, shadow_size=10)
-    return p, dict(hole=hole, body=(0, 0, W, H))
+    return p, dict(hole=hole, body=(0, 0, W, H), controls=controls)
 
 
 # --------------------------------------------------------------------------- main
@@ -1446,6 +1453,7 @@ def main(outdir, only=None):
             p.finish(edge_fade=4).save(os.path.join(outdir, fn), optimize=True)
             entry['tall'] = dict(file=fn, hole=norm(g['hole'], TALL), body=norm(g['body'], TALL),
                                  ar=round(TALL[0] / TALL[1], 5))
+            entry['tall']['controls'] = {k: norm(v, TALL) for k, v in g['controls'].items()}
             if 'fx' in POCKET[sysname]:
                 entry['tall']['fx'] = POCKET[sysname]['fx']
             print(sysname, 'tall', 'hole px', [round(v) for v in g['hole']], flush=True)

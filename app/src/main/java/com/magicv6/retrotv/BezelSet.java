@@ -37,18 +37,36 @@ final class BezelSet {
             scan = fx == null ? Float.NaN : (float) fx.optDouble("scan", Double.NaN);
             curve = fx == null ? Float.NaN : (float) fx.optDouble("curve", Double.NaN);
             vignette = fx == null ? Float.NaN : (float) fx.optDouble("vignette", Double.NaN);
+            JSONObject ct = o.optJSONObject("controls");
+            if (ct != null) {
+                for (java.util.Iterator<String> it = ct.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    controls.put(k, floats(ct.getJSONArray(k)));
+                }
+            }
         }
 
+        /** Touchable parts of the drawn case ("tune", "volume"), normalised like the hole. */
+        final Map<String, float[]> controls = new LinkedHashMap<>();
+
         /** Screen rectangle of the picture hole for an output of w x h (mirrors the shader). */
-        RectF hole(float w, float h) {
+        RectF hole(float w, float h) { return toScreen(hole, w, h); }
+
+        /** Screen rectangle of a control, or null if this art doesn't have it. */
+        RectF control(String name, float w, float h) {
+            float[] r = controls.get(name);
+            return r == null ? null : toScreen(r, w, h);
+        }
+
+        private RectF toScreen(float[] r, float w, float h) {
             float bx = body[0] * ar, by = body[1], bw = body[2] * ar, bh = body[3];
             float s = Math.min(w / bw, h / bh);
             float offX = w * 0.5f - (bx + bw * 0.5f) * s;
             float spareY = h - bh * s;
             float alignY = h > w * 1.02f ? 0f : 0.5f;
             float offY = spareY * alignY - by * s;
-            float x0 = offX + hole[0] * ar * s, y0 = offY + hole[1] * s;
-            return new RectF(x0, y0, x0 + hole[2] * ar * s, y0 + hole[3] * s);
+            float x0 = offX + r[0] * ar * s, y0 = offY + r[1] * s;
+            return new RectF(x0, y0, x0 + r[2] * ar * s, y0 + r[3] * s);
         }
     }
 

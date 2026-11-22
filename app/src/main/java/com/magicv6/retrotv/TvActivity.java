@@ -151,6 +151,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     @Override
     protected void onStart() {
         super.onStart();
+        standby = false;
         glView.onResume();
         createPlayer();
         if (pendingView != null) {
@@ -298,6 +299,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                 if (e.getActionMasked() == MotionEvent.ACTION_UP) hidePanel();
                 return true;
             }
+            if (wheelTouch(e)) return true;
             return gestures.onTouchEvent(e);
         });
 
@@ -422,6 +424,16 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         ttView.setLayoutParams(tl);
         ttView.setX(r.left);
         ttView.setY(r.top);
+        if (Build.VERSION.SDK_INT >= 29) {        // keep Android's edge back-swipe off the wheels
+            List<android.graphics.Rect> ex = new ArrayList<>();
+            BezelSet.Layout L = set.layoutFor(w, h);
+            for (String name : L.controls.keySet()) {
+                if (!isWheel(name)) continue;
+                RectF c = L.control(name, w, h);
+                ex.add(new android.graphics.Rect((int) c.left, (int) c.top, (int) c.right, (int) c.bottom));
+            }
+            glView.setSystemGestureExclusionRects(ex);
+        }
         FrameLayout.LayoutParams kl = (FrameLayout.LayoutParams) ttKeys.getLayoutParams();
         kl.bottomMargin = h > w ? dp(24) : dp(8);
         ttKeys.setLayoutParams(kl);
@@ -1017,6 +1029,166 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     public void guideClose() {
         guide.setVisibility(View.GONE);
         immersive();
+    }
+
+    // ---------------------------------------------------------------- drawn controls (pocket TV art)
+
+    private String wheel;                 // "tune" / "volume" while a wheel or CH / VOL button is held
+    private String button;                // any drawn button being held
+    private RectF wheelRect;
+    private float wheelY, wheelAcc;
+    private int wheelSteps;
+    private Xtream.Channel pendingCh;     // channel shown while spinning the tuning wheel
+    private boolean standby;              // POWER button: screen dark, playback stopped
+
+    private static boolean isWheel(String n) { return n.equals("tune") || n.equals("volume"); }
+
+    /** Wheels: drag to step, tap upper / lower half for one step. Buttons: press (CH / VOL repeat while held). */
+    private boolean wheelTouch(MotionEvent e) {
+        float x = e.getX(), y = e.getY();
+        switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN: {
+                BezelSet.Layout L = set.layoutFor(glView.getWidth(), glView.getHeight());
+                for (String name : L.controls.keySet()) {
+                    RectF r = L.control(name, glView.getWidth(), glView.getHeight());
+                    if (!r.contains(x, y)) continue;
+                    if (standby && !name.equals("power")) return true;   // only POWER works in standby
+                    wheelRect = r;
+                    wheelSteps = 0;
+                    if (isWheel(name)) {
+                        wheel = name;
+                        wheelY = y;
+                        wheelAcc = 0;
+                    } else {
+                        button = name;
+                        pressButton(name);
+                    }
+                    return true;
+                }
+                return standby;                   // swallow other taps while the set is off
+            }
+            case MotionEvent.ACTION_MOVE:
+                if (button != null) return true;
+                if (wheel == null) return standby;
+                wheelAcc += wheelY - y;          // finger up = turn up
+                wheelY = y;
+                float step = dp(26);
+                while (wheelAcc >= step) { wheelStep(1); wheelAcc -= step; }
+                while (wheelAcc <= -step) { wheelStep(-1); wheelAcc += step; }
+                return true;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (button != null) {
+                    String b = button;
+                    button = null;
+                    ui.removeCallbacks(repeat);
+                    wheelEnd();
+                    // one-shot buttons act on release (a panel opened on press would be shut by this UP)
+                    if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelRect.contains(x, y)) releaseButton(b);
+                    return true;
+                }
+                if (wheel == null) return standby;
+                if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelSteps == 0)
+                    wheelStep(y < wheelRect.centerY() ? 1 : -1);
+                wheelEnd();
+                return true;
+        }
+        return wheel != null || button != null;
+    }
+
+    private int repeatDir;
+    private final Runnable repeat = new Runnable() {
+        @Override public void run() {
+            if (wheel == null) return;
+            wheelStep(repeatDir);
+            ui.postDelayed(this, 170);
+        }
+    };
+
+    private void pressButton(String name) {
+        glView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY);
+        switch (name) {
+            case "ch_up": case "ch_down": case "vol_up": case "vol_down":
+                wheel = name.startsWith("ch") ? "tune" : "volume";
+                repeatDir = name.endsWith("up") ? 1 : -1;
+                wheelStep(repeatDir);
+                ui.postDelayed(repeat, 450);      // hold to keep going
+                break;
+        }
+    }
+
+    private void releaseButton(String name) {
+        switch (name) {
+            case "tvav":
+                if (ttView.isOpen()) ttClose(); else openTeletext();
+                break;
+            case "menu":
+                if (ttView.isOpen()) ttClose();
+                showPanel();
+                break;
+            case "power":
+                togglePower();
+                break;
+        }
+    }
+
+    private void wheelStep(int dir) {
+        wheelSteps++;
+        glView.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+        if ("volume".equals(wheel)) {
+            android.media.AudioManager am = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+            am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                    dir > 0 ? android.media.AudioManager.ADJUST_RAISE : android.media.AudioManager.ADJUST_LOWER, 0);
+            int v = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+            int max = Math.max(1, am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC));
+            int bars = Math.round(v * 16f / max);
+            StringBuilder b = new StringBuilder("VOL ");
+            for (int i = 0; i < 16; i++) b.append(i < bars ? '█' : '·');
+            osd(b.toString(), null, false);
+            return;
+        }
+        // tuning
+        if (ttView.isOpen()) { ttView.onKey(dir > 0 ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN); return; }
+        if (vod != null) { seekBy(dir * 10_000L); return; }
+        List<Xtream.Channel> l = curList.contains(current) ? curList : all;
+        if (l.isEmpty() || current == null) return;
+        Xtream.Channel from = pendingCh != null ? pendingCh : current;
+        pendingCh = l.get((l.indexOf(from) + dir + l.size()) % l.size());
+        osd(chLabel(pendingCh), pendingCh.name, false);
+    }
+
+    /** Letting go of the tuning wheel / CH button tunes to the channel it stopped on. */
+    private void wheelEnd() {
+        wheel = null;
+        Xtream.Channel c = pendingCh;
+        pendingCh = null;
+        if (c != null && (current == null || !c.id.equals(current.id))) play(c);
+    }
+
+    /** Standby: picture off and playback stopped; POWER again resumes. */
+    private void togglePower() {
+        if (!standby) {
+            standby = true;
+            if (ttView.isOpen()) ttClose();
+            hidePanel();
+            hideOsd.run();
+            if (vod != null) {
+                hideTransport();
+                if (player != null) player.setPlayWhenReady(false);
+                saveVodPos();
+            } else if (player != null) {
+                player.stop();
+            }
+            renderer.setHasVideo(false);
+            renderer.setStatic(0f);
+        } else {
+            standby = false;
+            if (vod != null) {
+                if (player != null) player.setPlayWhenReady(true);
+            } else if (current != null) {
+                play(current);
+            }
+        }
     }
 
     private int dp(int v) {
