@@ -98,8 +98,8 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
     private final Host host;
 
     private int prog, oesTex;
-    private final int[] bezTex = new int[2];        // 0 = wide, 1 = square
-    private final float[][] bezSz = new float[2][2];
+    private final int[] bezTex = new int[3];        // 0 = wide, 1 = square, 2 = tall
+    private final float[][] bezSz = new float[3][2];
     private SurfaceTexture st;
     private final float[] stm = new float[16];
     private FloatBuffer quad;
@@ -133,11 +133,12 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
         quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         quad.put(new float[]{-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
 
-        int[] t = new int[3];
-        GLES20.glGenTextures(3, t, 0);
+        int[] t = new int[4];
+        GLES20.glGenTextures(4, t, 0);
         oesTex = t[0];
         bezTex[0] = t[1];
         bezTex[1] = t[2];
+        bezTex[2] = t[3];
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex);
         texParams(GLES11Ext.GL_TEXTURE_EXTERNAL_OES);
 
@@ -167,6 +168,7 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
         if (set != loaded) {
             upload(bezTex[0], set.wide.file, bezSz[0]);
             upload(bezTex[1], set.square.file, bezSz[1]);
+            if (set.tall != null) upload(bezTex[2], set.tall.file, bezSz[2]);
             loaded = set;
         }
         if (frameAvail) {
@@ -179,9 +181,8 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
             }
         }
 
-        boolean wide = (float) outW / outH >= BezelSet.SWITCH_AR;
-        BezelSet.Layout L = wide ? set.wide : set.square;
-        int bi = wide ? 0 : 1;
+        BezelSet.Layout L = set.layoutFor(outW, outH);
+        int bi = L == set.wide ? 0 : L == set.square ? 1 : 2;
 
         noise += (noiseTarget - noise) * 0.2f;
         if (Math.abs(noiseTarget - noise) < 0.01f) noise = noiseTarget;
@@ -202,11 +203,11 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
         GLES20.glUniform1f(loc("uAR"), L.ar);
         GLES20.glUniform1f(loc("uSrcAR"), srcAR);
         GLES20.glUniform1f(loc("uHasVideo"), hasVideo ? 1f : 0f);
-        GLES20.glUniform1f(loc("uScan"), set.scan);
+        GLES20.glUniform1f(loc("uScan"), set.scan(L));
         GLES20.glUniform1f(loc("uLines"), set.lines);
-        GLES20.glUniform1f(loc("uCurve"), set.curve);
-        GLES20.glUniform1f(loc("uVig"), set.vignette);
-        GLES20.glUniform1f(loc("uBright"), set.bright());
+        GLES20.glUniform1f(loc("uCurve"), set.curve(L));
+        GLES20.glUniform1f(loc("uVig"), set.vignette(L));
+        GLES20.glUniform1f(loc("uBright"), set.bright(L));
         GLES20.glUniform1f(loc("uNoise"), noise);
         GLES20.glUniform1f(loc("uTime"), ((SystemClock.uptimeMillis() - t0) % 100000) / 1000f);
 
