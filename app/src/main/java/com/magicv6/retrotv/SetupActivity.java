@@ -15,7 +15,13 @@ import android.widget.TextView;
 
 /** Xtream login form. Details are saved only in this app's private storage on the phone. */
 public class SetupActivity extends Activity {
-    private EditText server, user, pass;
+    private EditText server, user, pass, town;
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        new Prefs(this).weatherTown(town.getText().toString());   // saved without needing Connect
+    }
     private CheckBox hls;
     private TextView status;
     private Button go;
@@ -58,6 +64,14 @@ public class SetupActivity extends Activity {
         status.setPadding(0, dp(12), 0, 0);
         status.setGravity(Gravity.START);
         col.addView(status);
+
+        TextView wx = new TextView(this);
+        wx.setText("Teletext");
+        wx.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        wx.setPadding(0, dp(28), 0, dp(4));
+        col.addView(wx);
+        town = field(col, "Weather town (e.g. Leeds) - blank for London", p.weatherTown(),
+                InputType.TYPE_TEXT_VARIATION_POSTAL_ADDRESS);
 
         ScrollView sv = new ScrollView(this);
         sv.setFitsSystemWindows(true);

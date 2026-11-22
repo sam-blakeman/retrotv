@@ -35,6 +35,10 @@ final class Prefs {
     String bezelSet() { return sp.getString("set", "tvwide"); }
     void bezelSet(String s) { sp.edit().putString("set", s).apply(); }
 
+    /** Town for the teletext weather pages ("" = London). */
+    String weatherTown() { return sp.getString("town", ""); }
+    void weatherTown(String t) { sp.edit().putString("town", t.trim()).apply(); }
+
     Set<String> favs() { return new HashSet<>(sp.getStringSet("favs", new HashSet<>())); }
     void favs(Set<String> f) { sp.edit().putStringSet("favs", new HashSet<>(f)).apply(); }
 }

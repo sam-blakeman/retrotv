@@ -43,6 +43,8 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
             "varying vec2 vUV;\n" +
             "uniform samplerExternalOES uVideo;\n" +
             "uniform sampler2D uBezel;\n" +
+            "uniform sampler2D uText;\n" +
+            "uniform float uTextOn, uTextMix;\n" +
             "uniform mat4 uSTM;\n" +
             "uniform vec2 uOut, uTexSz;\n" +
             "uniform vec4 uHole, uBody;\n" +
@@ -71,6 +73,17 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
             "      if (r > 1.0) gv.y = (g.y - 0.5) * r + 0.5; else gv.x = (g.x - 0.5) / r + 0.5;\n" +
             "      if (uHasVideo > 0.5 && gv.x >= 0.0 && gv.x <= 1.0 && gv.y >= 0.0 && gv.y <= 1.0)\n" +
             "        col = texture2D(uVideo, (uSTM * vec4(gv.x, 1.0 - gv.y, 0.0, 1.0)).xy).rgb;\n" +
+            // teletext page (4:3, fitted inside the tube), opaque unless MIX
+            "      if (uTextOn > 0.5) {\n" +
+            "        if (uTextMix < 0.5) col = vec3(0.0);\n" +
+            "        vec2 tg = g;\n" +
+            "        float r2 = (4.0 / 3.0) / (hs.x / hs.y);\n" +
+            "        if (r2 > 1.0) tg.y = (g.y - 0.5) * r2 + 0.5; else tg.x = (g.x - 0.5) / r2 + 0.5;\n" +
+            "        if (tg.x >= 0.0 && tg.x <= 1.0 && tg.y >= 0.0 && tg.y <= 1.0) {\n" +
+            "          vec4 t = texture2D(uText, tg);\n" +
+            "          col = col * (1.0 - t.a) + t.rgb;\n" +
+            "        }\n" +
+            "      }\n" +
             "      if (uNoise > 0.0) {\n" +
             "        float n = rnd(floor(g * vec2(360.0, 270.0)) + fract(uTime) * vec2(91.7, 37.3));\n" +
             "        float band = 0.85 + 0.15 * sin(g.y * 40.0 + uTime * 30.0);\n" +
@@ -114,6 +127,10 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
     private volatile float noiseTarget = 1f;
     private float noise = 1f;
 
+    private int textTex;
+    private volatile Bitmap textFrame;       // latest teletext page (null = off)
+    private volatile boolean textMix, textDirty;
+
     BezelRenderer(Context ctx, GLSurfaceView view, Host host, BezelSet initial) {
         this.ctx = ctx;
         this.view = view;
@@ -127,18 +144,28 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
     void setHasVideo(boolean b) { hasVideo = b; view.requestRender(); }
     void setStatic(float amount) { noiseTarget = amount; view.requestRender(); }
 
+    /** Shows a teletext page on the tube; null turns it off. The bitmap must not change afterwards. */
+    void setText(Bitmap frame, boolean mix) {
+        textFrame = frame;
+        textMix = mix;
+        textDirty = true;
+        view.requestRender();
+    }
+
     @Override
     public void onSurfaceCreated(GL10 unused, EGLConfig config) {
         prog = link(VS, FS);
         quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         quad.put(new float[]{-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
 
-        int[] t = new int[4];
-        GLES20.glGenTextures(4, t, 0);
+        int[] t = new int[5];
+        GLES20.glGenTextures(5, t, 0);
         oesTex = t[0];
         bezTex[0] = t[1];
         bezTex[1] = t[2];
         bezTex[2] = t[3];
+        textTex = t[4];
+        textDirty = true;
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex);
         texParams(GLES11Ext.GL_TEXTURE_EXTERNAL_OES);
 
@@ -194,6 +221,17 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, bezTex[bi]);
         GLES20.glUniform1i(loc("uBezel"), 1);
+        Bitmap tf = textFrame;
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE2);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textTex);
+        if (textDirty && tf != null) {
+            textDirty = false;
+            texParams(GLES20.GL_TEXTURE_2D);
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, tf, 0);
+        }
+        GLES20.glUniform1i(loc("uText"), 2);
+        GLES20.glUniform1f(loc("uTextOn"), tf != null ? 1f : 0f);
+        GLES20.glUniform1f(loc("uTextMix"), textMix ? 1f : 0f);
 
         GLES20.glUniformMatrix4fv(loc("uSTM"), 1, false, stm, 0);
         GLES20.glUniform2f(loc("uOut"), outW, outH);
@@ -208,7 +246,7 @@ final class BezelRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
         GLES20.glUniform1f(loc("uCurve"), set.curve(L));
         GLES20.glUniform1f(loc("uVig"), set.vignette(L));
         GLES20.glUniform1f(loc("uBright"), set.bright(L));
-        GLES20.glUniform1f(loc("uNoise"), noise);
+        GLES20.glUniform1f(loc("uNoise"), tf != null && !textMix ? 0f : noise);
         GLES20.glUniform1f(loc("uTime"), ((SystemClock.uptimeMillis() - t0) % 100000) / 1000f);
 
         int aPos = GLES20.glGetAttribLocation(prog, "aPos");

@@ -55,7 +55,8 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public class TvActivity extends Activity implements BezelRenderer.Host, GuideView.Host, LibraryView.Host {
+public class TvActivity extends Activity implements BezelRenderer.Host, GuideView.Host, LibraryView.Host,
+        TeletextView.Host, Teletext.TvSource {
     private static final int GREEN = Color.rgb(90, 255, 120);
     private static final String FAV = "__fav", ALL = "__all";
 
@@ -77,6 +78,9 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     private GestureDetector gestures;
     private final EpgStore epg = new EpgStore();
     private GuideView guide;
+    private Teletext teletext;
+    private TeletextView ttView;
+    private View ttKeys;
     private LibraryView lib;
     private Vod.Resume resume;
 
@@ -189,6 +193,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     protected void onDestroy() {
         io.shutdownNow();
         epg.shutdown();
+        if (teletext != null) teletext.shutdown();
         super.onDestroy();
     }
 
@@ -220,10 +225,19 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
         guide = new GuideView(this, this, epg);
         guide.setVisibility(View.GONE);
-        epg.setListener(guide);
+        epg.setListener(id -> {
+            guide.onEpg(id);
+            if (teletext != null) teletext.onEpg();
+        });
         root.addView(guide, new FrameLayout.LayoutParams(-1, -1));
 
         buildTransport();
+        teletext = new Teletext(prefs, this);
+        ttView = new TeletextView(this, teletext, this);
+        ttView.setVisibility(View.GONE);
+        root.addView(ttView, new FrameLayout.LayoutParams(0, 0));
+        ttKeys = ttView.buildKeypad(this);
+        root.addView(ttKeys, new FrameLayout.LayoutParams(dp(300), -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
         lib = new LibraryView(this, this);
         lib.setVisibility(View.GONE);
         root.addView(lib, new FrameLayout.LayoutParams(-1, -1));
@@ -348,6 +362,10 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         head.addView(next, new LinearLayout.LayoutParams(dp(48), dp(48)));
         TextView guideBtn = headButton("▦", v -> openGuide());
         head.addView(guideBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView textBtn = headButton("TXT", v -> openTeletext());
+        textBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        textBtn.setTextColor(Color.rgb(255, 230, 60));
+        head.addView(textBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         head.addView(reload, new LinearLayout.LayoutParams(dp(48), dp(48)));
         reload.setTextColor(GREEN);
         reload.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
@@ -398,6 +416,15 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         holeBox.setLayoutParams(lp);
         holeBox.setX(r.left);
         holeBox.setY(r.top);
+        FrameLayout.LayoutParams tl = (FrameLayout.LayoutParams) ttView.getLayoutParams();
+        tl.width = (int) r.width();
+        tl.height = (int) r.height();
+        ttView.setLayoutParams(tl);
+        ttView.setX(r.left);
+        ttView.setY(r.top);
+        FrameLayout.LayoutParams kl = (FrameLayout.LayoutParams) ttKeys.getLayoutParams();
+        kl.bottomMargin = h > w ? dp(24) : dp(8);
+        ttKeys.setLayoutParams(kl);
         int m = (int) (r.height() * 0.06f);
         holeBox.setPadding(m * 3 / 2, m, m * 3 / 2, m);
         osdCh.setTextSize(TypedValue.COMPLEX_UNIT_PX, r.height() * 0.085f);
@@ -835,6 +862,14 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
     @Override
     public boolean onKeyDown(int code, KeyEvent e) {
+        if (ttView.isOpen()) {
+            return ttView.onKey(code) || super.onKeyDown(code, e);
+        }
+        if (code == KeyEvent.KEYCODE_TV_TELETEXT || code == KeyEvent.KEYCODE_T
+                || (code == KeyEvent.KEYCODE_BUTTON_START && vod == null)) {
+            openTeletext();
+            return true;
+        }
         if (guide.getVisibility() == View.VISIBLE) {
             return guide.onKey(code) || super.onKeyDown(code, e);
         }
@@ -902,12 +937,52 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        if (guide.getVisibility() == View.VISIBLE) guideClose();
+        if (ttView.isOpen()) ttView.back();
+        else if (guide.getVisibility() == View.VISIBLE) guideClose();
         else if (lib.getVisibility() == View.VISIBLE) lib.back();
         else if (panel.getVisibility() == View.VISIBLE) hidePanel();
         else if (vod != null) exitVod();
         else super.onBackPressed();
     }
+
+    // ---------------------------------------------------------------- teletext
+
+    private void openTeletext() {
+        hidePanel();
+        if (guide.getVisibility() == View.VISIBLE) guideClose();
+        hideOsd.run();
+        ttView.open();
+    }
+
+    @Override
+    public void ttShow(android.graphics.Bitmap frame, boolean mix) { renderer.setText(frame, mix); }
+
+    @Override
+    public void ttWatch(Xtream.Channel c) {
+        ttClose();
+        if (vod != null) exitVod();
+        if (current == null || !c.id.equals(current.id)) play(c);
+        else showOsd(false);
+    }
+
+    @Override
+    public void ttClose() {
+        ttView.close();
+        immersive();
+    }
+
+    @Override
+    public List<Xtream.Channel> ttChannels() {
+        Set<String> f = prefs.favs();
+        List<Xtream.Channel> out = new ArrayList<>();
+        for (Xtream.Channel ch : all) if (f.contains(ch.id)) out.add(ch);
+        if (out.isEmpty() && curList != null) out.addAll(curList.subList(0, Math.min(15, curList.size())));
+        return out;
+    }
+
+    @Override public List<Xtream.Programme> ttEpg(String id) { return epg.get(id); }
+
+    @Override public void ttWantEpg(List<Xtream.Channel> chans) { epg.want(chans); }
 
     // ---------------------------------------------------------------- TV guide
 
