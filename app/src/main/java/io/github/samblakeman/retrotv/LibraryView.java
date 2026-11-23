@@ -1,4 +1,4 @@
-package com.magicv6.retrotv;
+package io.github.samblakeman.retrotv;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
@@ -6,8 +6,10 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.text.Editable;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
@@ -40,13 +42,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Full-screen teletext-style browser for films, shows and search. */
+/** Full-screen teletext-style browser for films, shows, local videos and search. */
 final class LibraryView extends LinearLayout {
     interface Host {
         Xtream libXtream();
+        Prefs libPrefs();
         String libKey();
         List<Xtream.Channel> libChannels();
         Vod.Resume libResume();
@@ -54,7 +58,9 @@ final class LibraryView extends LinearLayout {
         void libPlay(Vod.Playable p, long startMs);
         void libClose();
         void libTv();
-        void libAskFiles();
+        void libAskMedia();
+        void libAddFolder();
+        void libRemoveFolder(String treeUri);
     }
 
     static final int FILMS = 0, SHOWS = 1, SEARCH = 2, VIDEOS = 3;
@@ -88,6 +94,16 @@ final class LibraryView extends LinearLayout {
     private boolean filmsLoading, showsLoading;
     private String filmsError, showsError;
 
+    // local videos cache
+    private List<Local.MediaFolder> mediaFolders;
+    private List<String[]> treeFolders;
+    private boolean localFoldersLoading;
+    private final Map<String, Local.TreeListing> treeCache = new HashMap<>();
+    private final java.util.Set<String> treeLoading = new java.util.HashSet<>();
+    private List<Local.Entry> localIndex;
+    private List<String> localNorm;
+    private boolean localIndexing;
+
     LibraryView(Context c, Host host) {
         super(c);
         this.host = host;
@@ -119,7 +135,7 @@ final class LibraryView extends LinearLayout {
         searchBox.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         searchBox.setTextColor(YELLOW);
         searchBox.setHintTextColor(GREY);
-        searchBox.setHint("Type a channel, film or show…");
+        searchBox.setHint("Type a channel, film, show or video…");
         searchBox.setSingleLine(true);
         searchBox.setImeOptions(EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         searchBox.setBackgroundColor(Color.rgb(20, 20, 30));
@@ -144,6 +160,11 @@ final class LibraryView extends LinearLayout {
         if (tab == SEARCH && stacks.get(SEARCH).size() <= 1) render();
     };
 
+    void shutdown() {
+        catIo.shutdownNow();
+        infoIo.shutdownNow();
+    }
+
     // ---------------------------------------------------------------- navigation
 
     /** Called when the login may have changed: drops everything from the old account. */
@@ -153,7 +174,9 @@ final class LibraryView extends LinearLayout {
         films = shows = null;
         filmsError = showsError = null;
         info.clear();
-        for (List<Screen> s : stacks) s.clear();
+        for (int i = 0; i < stacks.size(); i++) {
+            if (i != VIDEOS) stacks.get(i).clear();
+        }
     }
 
     void open(int t) {
@@ -350,8 +373,13 @@ final class LibraryView extends LinearLayout {
         });
     }
 
-    /** Adds a loading / error row and returns false while the catalogue isn't there yet. */
+    /** Adds a loading / error / no-login row and returns false while the catalogue isn't there yet. */
     private boolean libRows(List<Row> r, boolean isShows) {
+        if (host.libXtream() == null) {
+            r.add(row("No IPTV account configured.", YELLOW, null));
+            r.add(row("Add your Xtream Codes login in Settings (⚙) for Films & Shows, or switch to VIDEOS for local files.", GREY, null));
+            return false;
+        }
         Vod.Lib lib = isShows ? shows : films;
         if (lib != null) return true;
         ensure(isShows);
@@ -370,6 +398,7 @@ final class LibraryView extends LinearLayout {
     }
 
     private void ensure(boolean isShows) {
+        if (host.libXtream() == null) return;
         if (isShows ? (shows != null || showsLoading || showsError != null)
                 : (films != null || filmsLoading || filmsError != null)) return;
         if (isShows) showsLoading = true; else filmsLoading = true;
@@ -415,15 +444,17 @@ final class LibraryView extends LinearLayout {
             List<Row> r = new ArrayList<>();
             Vod.Resume rs = host.libResume();
             for (Vod.Playable rp : rs.recent(kind)) {
-                Vod.Playable p = kind.equals("local") ? withNext(rp) : rp;
-                long pos = rs.pos(p.key()), dur = rs.dur(p.key());
+                long pos = rs.pos(rp.key()), dur = rs.dur(rp.key());
                 SpannableStringBuilder sb = new SpannableStringBuilder();
-                append(sb, p.title, WHITE);
-                if (!p.sub.isEmpty()) append(sb, "  " + p.sub, CYAN);
+                append(sb, rp.title, WHITE);
+                if (!rp.sub.isEmpty()) append(sb, "  " + rp.sub, CYAN);
                 append(sb, "  ◔ " + Vod.clock(pos) + (dur > 0 ? " / " + Vod.clock(dur) : ""), GREEN);
-                Row row = row(sb, WHITE, () -> host.libPlay(p, pos));
+                Row row = row(sb, WHITE, () -> {
+                    if (kind.equals("local")) playLocalLinked(rp, pos);
+                    else host.libPlay(rp, pos);
+                });
                 row.hold = () -> {
-                    rs.forget(p);
+                    rs.forget(rp);
                     Toast.makeText(getContext(), "Removed from Continue watching", Toast.LENGTH_SHORT).show();
                     render();
                 };
@@ -435,42 +466,129 @@ final class LibraryView extends LinearLayout {
         });
     }
 
-    // ---------------------------------------------------------------- my videos (phone storage)
+    private void playLocalLinked(Vod.Playable p, long pos) {
+        final Context ctx = getContext().getApplicationContext();
+        final Set<String> trees = host.libPrefs().treeUris();
+        infoIo.execute(() -> {
+            Vod.Playable linked = Local.withNext(ctx, p, trees);
+            ui.post(() -> host.libPlay(linked, pos));
+        });
+    }
+
+    // ---------------------------------------------------------------- my videos (MediaStore + SAF)
+
+    private void ensureLocalFolders() {
+        if (mediaFolders != null || localFoldersLoading) return;
+        localFoldersLoading = true;
+        final Context ctx = getContext().getApplicationContext();
+        final Set<String> trees = host.libPrefs().treeUris();
+        catIo.execute(() -> {
+            List<Local.MediaFolder> mf = Local.mediaFolders(ctx);
+            List<String[]> tf = new ArrayList<>();
+            for (String ts : trees) {
+                Uri u = Uri.parse(ts);
+                tf.add(new String[]{ts, Local.treeLabel(ctx, u), Local.treeSubpath(u)});
+            }
+            tf.sort((a, b) -> Local.natural(a[1], b[1]));
+            ui.post(() -> {
+                mediaFolders = mf;
+                treeFolders = tf;
+                localFoldersLoading = false;
+                if (getVisibility() == VISIBLE && tab == VIDEOS && stacks.get(VIDEOS).size() <= 1) render();
+            });
+        });
+    }
 
     private Screen videosRoot() {
         return listScreen("MY VIDEOS", () -> {
             List<Row> r = new ArrayList<>();
-            if (!Local.hasAccess(getContext())) {
-                r.add(row("Allow Retro TV to read your video files – tap here", YELLOW, host::libAskFiles));
-                r.add(row("Android opens a settings page: switch on \"Allow access to manage all files\", "
-                        + "then press Back. (ES-DE hides the ROMs folders from the normal video permission, "
-                        + "so this one is needed.)", GREY, null));
-                return r;
-            }
             List<Vod.Playable> rec = host.libResume().recent("local");
             if (!rec.isEmpty()) r.add(row("\u25ba Continue watching (" + rec.size() + ")", GREEN,
                     () -> push(resumeScreen("local"))));
-            for (String[] root : Local.roots()) {
-                java.io.File d = new java.io.File(Local.storage(), root[0]);
-                SpannableStringBuilder sb = new SpannableStringBuilder();
-                append(sb, "\u25b8 " + root[1], WHITE);
-                append(sb, "   " + root[0], GREY);
-                r.add(row(sb, WHITE, () -> push(folderScreen(d))));
+
+            if (mediaFolders == null) {
+                ensureLocalFolders();
+                r.add(row("SCANNING VIDEO FOLDERS…", YELLOW, null));
+            } else {
+                // 1. User-picked SAF folders (works with .nomedia / ROMs / SD card)
+                if (treeFolders != null && !treeFolders.isEmpty()) {
+                    r.add(heading("ADDED FOLDERS"));
+                    for (String[] tf : treeFolders) {
+                        SpannableStringBuilder sb = new SpannableStringBuilder();
+                        append(sb, "\u25b8 " + tf[1], WHITE);
+                        if (!tf[2].isEmpty()) append(sb, "   " + tf[2], GREY);
+                        Row fr = row(sb, WHITE, () -> {
+                            Uri u = Uri.parse(tf[0]);
+                            push(treeFolderScreen(u, DocumentsContract.getTreeDocumentId(u), tf[1]));
+                        });
+                        fr.hold = () -> {
+                            host.libRemoveFolder(tf[0]);
+                            Toast.makeText(getContext(), "Removed folder: " + tf[1], Toast.LENGTH_SHORT).show();
+                        };
+                        r.add(fr);
+                    }
+                    r.add(row("(long-press an added folder to remove it)", GREY, null));
+                }
+
+                // 2. Device video folders via MediaStore
+                r.add(heading("DEVICE VIDEOS"));
+                if (!Local.hasMediaAccess(getContext())) {
+                    r.add(row("+ Allow access to device videos", YELLOW, host::libAskMedia));
+                    r.add(row("Lets Retro TV browse Movies, Downloads and Camera folders automatically.", GREY, null));
+                } else if (mediaFolders.isEmpty()) {
+                    r.add(row("No device video folders found", GREY, null));
+                } else {
+                    for (Local.MediaFolder f : mediaFolders) {
+                        SpannableStringBuilder sb = new SpannableStringBuilder();
+                        append(sb, "\u25b8 " + f.name, WHITE);
+                        append(sb, "  (" + f.videos.size() + ")", GREY);
+                        r.add(row(sb, WHITE, () -> push(mediaFolderScreen(f))));
+                    }
+                }
             }
-            if (r.isEmpty()) r.add(row("No video folders found", GREY, null));
+
+            r.add(heading("CUSTOM FOLDERS"));
+            r.add(row("+ Add a folder (SD card, .nomedia, custom…)", CYAN, host::libAddFolder));
+            r.add(row("Use Android's folder picker to add any folder, including folders with .nomedia files or on SD cards.", GREY, null));
             return r;
         });
     }
 
-    private Screen folderScreen(java.io.File dir) {
-        return listScreen(Local.label(dir), () -> {
+    private Screen mediaFolderScreen(Local.MediaFolder f) {
+        return listScreen(f.name, () -> {
             List<Row> r = new ArrayList<>();
-            for (java.io.File d : Local.dirs(dir)) {
-                r.add(row("\u25b8 " + d.getName() + "/", CYAN, () -> push(folderScreen(d))));
+            Map<String, Vod.Playable> chain = Local.chain(f.videos);
+            for (Local.Entry e : f.videos) r.add(localRow(chain.get(e.uri), null));
+            if (r.isEmpty()) r.add(row("No videos in this folder", GREY, null));
+            return r;
+        });
+    }
+
+    private Screen treeFolderScreen(Uri treeUri, String docId, String title) {
+        final String ck = treeUri.toString() + "|" + docId;
+        return listScreen(title, () -> {
+            List<Row> r = new ArrayList<>();
+            Local.TreeListing listing = treeCache.get(ck);
+            if (listing == null) {
+                if (treeLoading.add(ck)) {
+                    final Context ctx = getContext().getApplicationContext();
+                    catIo.execute(() -> {
+                        Local.TreeListing l = Local.listTree(ctx, treeUri, docId, title);
+                        ui.post(() -> {
+                            treeLoading.remove(ck);
+                            treeCache.put(ck, l);
+                            if (getVisibility() == VISIBLE && tab == VIDEOS) render();
+                        });
+                    });
+                }
+                r.add(row("LOADING FOLDER…", YELLOW, null));
+                return r;
             }
-            List<java.io.File> vids = Local.videos(dir);
-            Map<String, Vod.Playable> chain = Local.chain(vids);
-            for (java.io.File f : vids) r.add(localRow(chain.get(f.getAbsolutePath()), null));
+            for (Local.TreeDir d : listing.dirs) {
+                r.add(row("\u25b8 " + d.name + "/", CYAN, () -> push(treeFolderScreen(treeUri, d.docId, d.name))));
+            }
+            Map<String, Vod.Playable> chain = Local.chain(listing.videos);
+            for (Local.Entry e : listing.videos) r.add(localRow(chain.get(e.uri), null));
             if (r.isEmpty()) r.add(row("No videos in this folder", GREY, null));
             return r;
         });
@@ -491,26 +609,16 @@ final class LibraryView extends LinearLayout {
         return row;
     }
 
-    /** For a saved local item: re-links it to the rest of its folder so the next file plays after. */
-    private static Vod.Playable withNext(Vod.Playable p) {
-        if (p.localUri == null || !p.localUri.startsWith("file:")) return p;
-        java.io.File f = new java.io.File(android.net.Uri.parse(p.localUri).getPath());
-        java.io.File dir = f.getParentFile();
-        if (dir == null || !f.exists()) return p;
-        Vod.Playable c = Local.chain(Local.videos(dir)).get(f.getAbsolutePath());
-        return c != null ? c : p;
-    }
-
-    private List<java.io.File> localIndex;
-    private boolean localIndexing;
-
-    private void ensureLocal() {
-        if (localIndex != null || localIndexing || !Local.hasAccess(getContext())) return;
+    private void ensureLocalIndex() {
+        if (localIndex != null || localIndexing) return;
+        Set<String> trees = host.libPrefs().treeUris();
+        if (!Local.hasMediaAccess(getContext()) && trees.isEmpty()) return;
         localIndexing = true;
+        final Context ctx = getContext().getApplicationContext();
         catIo.execute(() -> {
-            List<java.io.File> l = Local.index();
-            List<String> norms = new ArrayList<>();
-            for (java.io.File f : l) norms.add(Vod.norm(Local.title(f.getName())));
+            List<Local.Entry> l = Local.index(ctx, trees);
+            List<String> norms = new ArrayList<>(l.size());
+            for (Local.Entry e : l) norms.add(Vod.norm(Local.title(e.name)));
             ui.post(() -> {
                 localIndex = l;
                 localNorm = norms;
@@ -520,10 +628,9 @@ final class LibraryView extends LinearLayout {
         });
     }
 
-    private List<String> localNorm;
-
     private void searchLocal(List<Row> r, String[] w) {
-        if (!Local.hasAccess(getContext())) return;
+        Set<String> trees = host.libPrefs().treeUris();
+        if (!Local.hasMediaAccess(getContext()) && trees.isEmpty()) return;
         if (localIndex == null) {
             r.add(heading("MY VIDEOS"));
             r.add(row("  still looking…", GREY, null));
@@ -535,17 +642,24 @@ final class LibraryView extends LinearLayout {
             if (!Vod.matches(localNorm.get(i), w)) continue;
             n++;
             if (hits.size() >= 100) continue;
-            java.io.File f = localIndex.get(i);
-            Vod.Playable p = withNext(Local.playable(f));
-            hits.add(localRow(p, Local.label(f.getParentFile())));
+            Local.Entry e = localIndex.get(i);
+            Vod.Playable p = Local.playable(e);
+            Row row = localRow(p, e.folder);
+            long pos = host.libResume().pos(p.key());
+            row.tap = () -> playLocalLinked(p, pos);
+            row.hold = () -> playLocalLinked(p, 0);
+            hits.add(row);
         }
         r.add(heading("MY VIDEOS  (" + n + ")"));
         if (hits.isEmpty()) r.add(row("  none", GREY, null));
         r.addAll(hits);
     }
 
-    /** The phone's files may have changed (or access was just granted): look again next time. */
+    /** The phone's files or permissions may have changed: look again next time. */
     void forgetLocal() {
+        mediaFolders = null;
+        treeFolders = null;
+        treeCache.clear();
         localIndex = null;
         localNorm = null;
     }
@@ -557,44 +671,49 @@ final class LibraryView extends LinearLayout {
 
     private Screen searchRoot() {
         return listScreen("SEARCH", () -> {
-            ensure(false);
-            ensure(true);
-            ensureLocal();
+            boolean hasIptv = host.libXtream() != null;
+            if (hasIptv) {
+                ensure(false);
+                ensure(true);
+            }
+            ensureLocalIndex();
             List<Row> r = new ArrayList<>();
             String q = searchBox.getText().toString();
             String[] w = Vod.words(q);
             if (w.length == 0) {
-                r.add(row("Search TV channels, films and shows.", GREY, null));
-                r.add(row("Type part of a name, e.g. \"bbc\" or \"star wars\".", GREY, null));
+                r.add(row(hasIptv ? "Search TV channels, films, shows and videos." : "Search your local videos.", GREY, null));
+                r.add(row("Type part of a name to filter.", GREY, null));
                 return r;
             }
             String first = " " + w[0];
 
-            List<Xtream.Channel> ch = host.libChannels();
-            if (ch != normFor) {
-                normFor = ch;
-                chNorm = new String[ch.size()];
-                for (int i = 0; i < ch.size(); i++) chNorm[i] = Vod.norm(ch.get(i).name);
-            }
-            List<Row> hits = new ArrayList<>();
-            int n = 0;
-            for (int i = 0; i < ch.size(); i++) {
-                if (!Vod.matches(chNorm[i], w)) continue;
-                n++;
-                if (hits.size() >= 60) continue;
-                Xtream.Channel c = ch.get(i);
-                SpannableStringBuilder sb = new SpannableStringBuilder();
-                append(sb, "TV  ", GREEN);
-                append(sb, c.num + "  ", GREY);
-                append(sb, c.name, WHITE);
-                hits.add(row(sb, WHITE, () -> { hideKeyboard(); host.libWatchLive(c); }));
-            }
-            r.add(heading("TV CHANNELS  (" + n + (n > hits.size() ? ", first " + hits.size() : "") + ")"));
-            if (hits.isEmpty()) r.add(row("  none", GREY, null));
-            r.addAll(hits);
+            if (hasIptv) {
+                List<Xtream.Channel> ch = host.libChannels();
+                if (ch != normFor) {
+                    normFor = ch;
+                    chNorm = new String[ch.size()];
+                    for (int i = 0; i < ch.size(); i++) chNorm[i] = Vod.norm(ch.get(i).name);
+                }
+                List<Row> hits = new ArrayList<>();
+                int n = 0;
+                for (int i = 0; i < ch.size(); i++) {
+                    if (!Vod.matches(chNorm[i], w)) continue;
+                    n++;
+                    if (hits.size() >= 60) continue;
+                    Xtream.Channel c = ch.get(i);
+                    SpannableStringBuilder sb = new SpannableStringBuilder();
+                    append(sb, "TV  ", GREEN);
+                    append(sb, c.num + "  ", GREY);
+                    append(sb, c.name, WHITE);
+                    hits.add(row(sb, WHITE, () -> { hideKeyboard(); host.libWatchLive(c); }));
+                }
+                r.add(heading("TV CHANNELS  (" + n + (n > hits.size() ? ", first " + hits.size() : "") + ")"));
+                if (hits.isEmpty()) r.add(row("  none", GREY, null));
+                r.addAll(hits);
 
-            searchLib(r, w, first, false);
-            searchLib(r, w, first, true);
+                searchLib(r, w, first, false);
+                searchLib(r, w, first, true);
+            }
             searchLocal(r, w);
             return r;
         });
@@ -785,7 +904,6 @@ final class LibraryView extends LinearLayout {
             for (Map.Entry<Integer, List<Vod.Episode>> e : seasons.entrySet())
                 for (Vod.Episode ep : e.getValue()) if (ep.id.equals(p.id)) return e.getKey();
         }
-        // otherwise the first season that still has unwatched episodes
         for (Map.Entry<Integer, List<Vod.Episode>> e : seasons.entrySet())
             for (Vod.Episode ep : e.getValue())
                 if (!host.libResume().watched("ep:" + ep.id)) return e.getKey();
@@ -842,7 +960,6 @@ final class LibraryView extends LinearLayout {
         final TextView title, meta, plot, credits;
         final int posterW;
         private final boolean wide = wide();
-        private LinearLayout side;
 
         Detail(String posterUrl) {
             Context c = getContext();
@@ -881,7 +998,6 @@ final class LibraryView extends LinearLayout {
                 LayoutParams lp = new LayoutParams(0, -1, 1);
                 lp.leftMargin = dp(18);
                 root.addView(sv, lp);
-                side = null;
             } else {
                 LinearLayout topRow = new LinearLayout(c);
                 topRow.addView(poster, new LayoutParams(posterW, (int) (posterW * 1.5f)));
@@ -890,7 +1006,6 @@ final class LibraryView extends LinearLayout {
                 LayoutParams lp = new LayoutParams(0, -2, 1);
                 lp.leftMargin = dp(14);
                 topRow.addView(right, lp);
-                // in portrait the title + meta sit beside the poster, the rest below
                 info.removeView(title);
                 info.removeView(meta);
                 right.addView(title);
@@ -901,14 +1016,9 @@ final class LibraryView extends LinearLayout {
                 LayoutParams sl = new LayoutParams(-1, 0, 1);
                 sl.topMargin = dp(10);
                 root.addView(sv, sl);
-                side = right;
             }
         }
 
-        /**
-         * For shows: an episode list takes the space under the buttons. The info column stops
-         * scrolling on its own and the list fills the rest.
-         */
         ListView makeList(RowAdapter ad) {
             ScrollView sv = (ScrollView) info.getParent();
             ViewGroup parent = (ViewGroup) sv.getParent();
@@ -919,7 +1029,7 @@ final class LibraryView extends LinearLayout {
             ListView l = listViewFor(ad);
             l.setItemsCanFocus(true);
             View header = info;
-            if (!wide) {                      // portrait: the poster row scrolls away with the rest
+            if (!wide) {
                 View topRow = root.getChildAt(0);
                 root.removeView(topRow);
                 LinearLayout box = new LinearLayout(getContext());
@@ -995,7 +1105,7 @@ final class LibraryView extends LinearLayout {
                 t.setPadding(dp(12), dp(11), dp(12), dp(11));
             }
             Row r = rows.get(i);
-            boolean info = r.tap == null && r.hold == null && !r.heading;   // help text may wrap
+            boolean info = r.tap == null && r.hold == null && !r.heading;
             t.setSingleLine(!info);
             t.setMaxLines(info ? 8 : 1);
             t.setEllipsize(TextUtils.TruncateAt.END);

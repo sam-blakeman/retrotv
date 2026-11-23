@@ -1,4 +1,4 @@
-package com.magicv6.retrotv;
+package io.github.samblakeman.retrotv;
 
 import android.os.Handler;
 import android.os.Looper;

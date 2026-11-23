@@ -1,4 +1,4 @@
-package com.magicv6.retrotv;
+package io.github.samblakeman.retrotv;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -70,7 +70,7 @@ final class Vod {
             this.image = image == null ? "" : image;
         }
 
-        // local files (phone storage or a file handed over by ES-DE)
+        // local files (phone storage or a file handed over via ACTION_VIEW)
         String localUri, localKey;
         String fileUri;          // file:// form of a handed-over content:// URI, for "Continue watching"
 

@@ -1,14 +1,40 @@
 plugins { id 'com.android.application' }
 
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
 android {
-    namespace 'com.magicv6.retrotv'
+    namespace 'io.github.samblakeman.retrotv'
     compileSdk 35
     defaultConfig {
-        applicationId 'com.magicv6.retrotv'
+        applicationId 'io.github.samblakeman.retrotv'
         minSdk 26
         targetSdk 35
         versionCode 1
-        versionName '1.0'
+        versionName '1.0.0'
+    }
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -19,6 +45,6 @@ android {
 dependencies {
     implementation 'androidx.media3:media3-exoplayer:1.6.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.6.1'
-    // Software audio decoders (MP2, AC-3, E-AC-3, DTS...) for broadcast channels the phone can't decode
+    // Software audio decoders (MP2, AC-3, E-AC-3, DTS...) for broadcast channels devices can't decode in hardware
     implementation 'org.jellyfin.media3:media3-ffmpeg-decoder:1.6.1+2'
 }

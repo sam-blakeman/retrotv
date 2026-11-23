@@ -1,10 +1,13 @@
-package com.magicv6.retrotv;
+package io.github.samblakeman.retrotv;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.net.Uri;
 import android.opengl.GLSurfaceView;
 import android.os.Build;
 import android.os.Bundle;
@@ -31,23 +34,24 @@ import android.widget.Toast;
 
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
-import androidx.media3.common.VideoSize;
-import androidx.media3.common.Format;
-import androidx.media3.common.Tracks;
 import androidx.media3.common.TrackSelectionOverride;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
 import androidx.media3.common.text.Cue;
 import androidx.media3.common.text.CueGroup;
-import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,11 +63,20 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         TeletextView.Host, Teletext.TvSource {
     private static final int GREEN = Color.rgb(90, 255, 120);
     private static final String FAV = "__fav", ALL = "__all";
+    private static final int REQ_MEDIA = 101, REQ_TREE = 102;
+    private static final String[] MENU_NO_IPTV = {
+            "▸  My Videos (local files)",
+            "▸  RETROTEXT (News · Weather)",
+            "▸  IPTV Login & Settings",
+            "▸  Switch TV Bezel (CRT / Widescreen)",
+    };
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
 
     private Prefs prefs;
+    private boolean debuggable;
+    private Set<String> favSet = new HashSet<>();
     private Map<String, BezelSet> sets;
     private BezelSet set;
 
@@ -72,7 +85,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     private BezelRenderer renderer;
     private TextView osdCh, osdInfo;
     private LinearLayout panel;
-    private TextView catTitle;
+    private TextView catTitle, catPrev, catNext;
     private ListView list;
     private ChannelAdapter adapter;
     private GestureDetector gestures;
@@ -84,8 +97,8 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     private LibraryView lib;
     private Vod.Resume resume;
 
-    // films / episodes
-    private Vod.Playable vod;               // null = watching live TV
+    // films / episodes / local videos
+    private Vod.Playable vod;               // null = watching live TV or standby menu
     private boolean liveOn;                 // a live channel is loaded in the player
     private boolean vodFailed;
     private LinearLayout transport;
@@ -119,7 +132,9 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
             getWindow().getAttributes().layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
+        debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
         prefs = new Prefs(this);
+        favSet = prefs.favs();
         sets = BezelSet.loadAll(this);
         set = sets.containsKey(prefs.bezelSet()) ? sets.get(prefs.bezelSet()) : sets.get("tvwide");
         testUrl = getIntent().getStringExtra("url");
@@ -159,11 +174,21 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         } else if (fromExternal && vod != null) {
             playVod(vod, lastPos, false);
         } else if (fromExternal) {
-            // browsing MY VIDEOS after a file from ES-DE: nothing to restart
+            // browsing MY VIDEOS after an external file: nothing to restart
         } else if (testUrl != null) {
             playUrl(testUrl);
         } else if (!prefs.hasLogin()) {
-            startActivity(new Intent(this, SetupActivity.class));
+            if (loadedStamp != prefs.loginStamp()) {
+                clearIptv();
+                loadedStamp = prefs.loginStamp();
+            }
+            if (!prefs.skippedLogin()) {
+                startActivity(new Intent(this, SetupActivity.class));
+            } else if (vod != null) {
+                playVod(vod, lastPos, false);
+            } else if (lib.getVisibility() != View.VISIBLE) {
+                showWelcome();
+            }
         } else if (loadedStamp != prefs.loginStamp()) {
             vod = null;
             lib.close();
@@ -195,6 +220,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         io.shutdownNow();
         epg.shutdown();
         if (teletext != null) teletext.shutdown();
+        if (lib != null) lib.shutdown();
         super.onDestroy();
     }
 
@@ -202,6 +228,25 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) immersive();
+    }
+
+    private void clearIptv() {
+        xt = null;
+        epg.setXtream(null);
+        cats.clear();
+        byCat.clear();
+        all.clear();
+        curList = new ArrayList<>();
+        current = null;
+        liveOn = false;
+        loadFailed = false;
+        lib.setSource(libKey());
+    }
+
+    private void showWelcome() {
+        renderer.setHasVideo(false);
+        renderer.setStatic(0.45f);
+        osd("RETRO TV", "TAP FOR MENU · VIDEOS · TELETEXT · SETTINGS", true);
     }
 
     // ---------------------------------------------------------------- UI
@@ -335,9 +380,16 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         TextView shows = headButton("SHOWS", v -> openLibrary(LibraryView.SHOWS));
         TextView find = headButton("FIND", v -> openLibrary(LibraryView.SEARCH));
         TextView mine = headButton("VIDEOS", v -> openLibrary(LibraryView.VIDEOS));
-        TextView gear = headButton("⚙", v -> startActivity(new Intent(this, SetupActivity.class)));
+        TextView gear = headButton("⚙", v -> {
+            hidePanel();
+            startActivity(new Intent(this, SetupActivity.class));
+        });
         TextView reload = headButton("↻", v -> {
             hidePanel();
+            if (!prefs.hasLogin()) {
+                startActivity(new Intent(this, SetupActivity.class));
+                return;
+            }
             Toast.makeText(this, "Refreshing channel list…", Toast.LENGTH_SHORT).show();
             loadChannels();
         });
@@ -355,13 +407,13 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
         LinearLayout head = new LinearLayout(this);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView prev = headButton("◄", v -> switchCat(-1));
+        catPrev = headButton("◄", v -> switchCat(-1));
         catTitle = headButton("", null);
         catTitle.setGravity(Gravity.CENTER);
-        TextView next = headButton("►", v -> switchCat(1));
-        head.addView(prev, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        catNext = headButton("►", v -> switchCat(1));
+        head.addView(catPrev, new LinearLayout.LayoutParams(dp(48), dp(48)));
         head.addView(catTitle, new LinearLayout.LayoutParams(0, dp(48), 1));
-        head.addView(next, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        head.addView(catNext, new LinearLayout.LayoutParams(dp(48), dp(48)));
         TextView guideBtn = headButton("▦", v -> openGuide());
         head.addView(guideBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         TextView textBtn = headButton("TXT", v -> openTeletext());
@@ -379,16 +431,32 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         adapter = new ChannelAdapter();
         list.setAdapter(adapter);
         list.setOnItemClickListener((p, v, pos, id) -> {
-            play(curList.get(pos));
-            hidePanel();
+            if (cats.isEmpty() && !prefs.hasLogin()) {
+                handleNoIptvMenu(pos);
+                return;
+            }
+            if (pos >= 0 && pos < curList.size()) {
+                play(curList.get(pos));
+                hidePanel();
+            }
         });
         list.setOnItemLongClickListener((p, v, pos, id) -> {
+            if (cats.isEmpty() || pos < 0 || pos >= curList.size()) return false;
             toggleFav(curList.get(pos));
             return true;
         });
         panel.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
 
         root.addView(panel, new FrameLayout.LayoutParams(-1, -1, Gravity.START));
+    }
+
+    private void handleNoIptvMenu(int pos) {
+        switch (pos) {
+            case 0: openLibrary(LibraryView.VIDEOS); break;
+            case 1: openTeletext(); break;
+            case 2: hidePanel(); startActivity(new Intent(this, SetupActivity.class)); break;
+            case 3: hidePanel(); toggleBezel(); break;
+        }
     }
 
     private TextView headButton(String text, View.OnClickListener l) {
@@ -430,7 +498,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
             for (String name : L.controls.keySet()) {
                 if (!isWheel(name)) continue;
                 RectF c = L.control(name, w, h);
-                ex.add(new android.graphics.Rect((int) c.left, (int) c.top, (int) c.right, (int) c.bottom));
+                if (c != null) ex.add(new android.graphics.Rect((int) c.left, (int) c.top, (int) c.right, (int) c.bottom));
             }
             glView.setSystemGestureExclusionRects(ex);
         }
@@ -492,11 +560,19 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     }
 
     private void showPanel() {
+        if (ttView.isOpen()) ttView.close();
         if (cats.isEmpty()) {
             if (testUrl != null) return;
-            if (loadFailed) loadChannels();
-            else if (!prefs.hasLogin()) startActivity(new Intent(this, SetupActivity.class));
-            return;
+            if (loadFailed) {
+                loadChannels();
+                return;
+            }
+            catPrev.setVisibility(View.INVISIBLE);
+            catNext.setVisibility(View.INVISIBLE);
+            catTitle.setText(prefs.hasLogin() ? "LOADING CHANNELS…" : "RETRO TV MENU");
+        } else {
+            catPrev.setVisibility(View.VISIBLE);
+            catNext.setVisibility(View.VISIBLE);
         }
         panel.setVisibility(View.VISIBLE);
         adapter.notifyDataSetChanged();
@@ -638,9 +714,8 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         if (c.id.equals(ALL)) {
             curList = all;
         } else if (c.id.equals(FAV)) {
-            Set<String> f = prefs.favs();
             curList = new ArrayList<>();
-            for (Xtream.Channel ch : all) if (f.contains(ch.id)) curList.add(ch);
+            for (Xtream.Channel ch : all) if (favSet.contains(ch.id)) curList.add(ch);
         } else {
             curList = byCat.get(c.id);
         }
@@ -656,10 +731,9 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     }
 
     private void toggleFav(Xtream.Channel c) {
-        Set<String> f = prefs.favs();
-        boolean added = f.add(c.id);
-        if (!added) f.remove(c.id);
-        prefs.favs(f);
+        boolean added = favSet.add(c.id);
+        if (!added) favSet.remove(c.id);
+        prefs.favs(favSet);
         Toast.makeText(this, (added ? "Added to" : "Removed from") + " favourites: " + c.name, Toast.LENGTH_SHORT).show();
         if (cats.get(catIdx).id.equals(FAV)) selectCat(catIdx);
         adapter.notifyDataSetChanged();
@@ -675,13 +749,8 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
     // ---------------------------------------------------------------- playback
 
-    /**
-     * Qualcomm's hardware H.264 decoder (c2.qti.avc) garbles interlaced broadcast feeds (field-coded
-     * 1080i/576i from UK DVB channels) into green/magenta blocks. Android's software decoder handles
-     * them correctly and is fast enough on this phone, so it goes first for H.264; others unchanged.
-     */
-    /** Live broadcasts only; films and episodes are progressive and play fine (and cooler) in hardware. */
-    private static volatile boolean preferSoftwareAvc = true;
+    /** Optional software H.264 decoder for interlaced live broadcasts (controlled by Settings). */
+    private static volatile boolean preferSoftwareAvc = false;
 
     private static final androidx.media3.exoplayer.mediacodec.MediaCodecSelector SOFTWARE_AVC_FIRST =
             (mime, secure, tunneling) -> {
@@ -720,7 +789,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                 if (v.width > 0 && v.height > 0) {
                     float ar = v.width * v.pixelWidthHeightRatio / v.height;
                     renderer.setSourceAspect(ar);
-                    // your own videos: 4:3 material gets the classic CRT, widescreen the wide TV
+                    // local videos: 4:3 material gets the classic CRT, widescreen gets the wide TV
                     if (vod != null && vod.isLocal() && bezelAuto) useBezel(ar < 1.55f ? "tvcrt" : "tvwide");
                 }
             }
@@ -791,8 +860,9 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
     private void play(Xtream.Channel c) {
         if (vod != null) endVod();
-        if (!preferSoftwareAvc && player != null) player.stop();
-        preferSoftwareAvc = true;
+        boolean wantSoft = prefs.softAvcLive();
+        if (preferSoftwareAvc != wantSoft && player != null) player.stop();
+        preferSoftwareAvc = wantSoft;
         liveOn = true;
         current = c;
         triedAlt = false;
@@ -822,7 +892,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     private final Runnable retry = () -> {
         if (current == null || vod != null || !liveOn) return;
         if (testUrl != null && xt == null) playUrl(testUrl);
-        else play(current);
+        else if (xt != null) play(current);
     };
 
     private void onStreamError(PlaybackException e) {
@@ -926,7 +996,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                     switchCat(1); return true;
                 case KeyEvent.KEYCODE_BUTTON_Y:
                     int p = list.getSelectedItemPosition();
-                    if (p >= 0) toggleFav(curList.get(p));
+                    if (p >= 0 && p < curList.size()) toggleFav(curList.get(p));
                     return true;
             }
             return super.onKeyDown(code, e);
@@ -980,14 +1050,17 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     @Override
     public void ttClose() {
         ttView.close();
+        if (!prefs.hasLogin() && vod == null && !liveOn
+                && panel.getVisibility() != View.VISIBLE && lib.getVisibility() != View.VISIBLE) {
+            showWelcome();
+        }
         immersive();
     }
 
     @Override
     public List<Xtream.Channel> ttChannels() {
-        Set<String> f = prefs.favs();
         List<Xtream.Channel> out = new ArrayList<>();
-        for (Xtream.Channel ch : all) if (f.contains(ch.id)) out.add(ch);
+        for (Xtream.Channel ch : all) if (favSet.contains(ch.id)) out.add(ch);
         if (out.isEmpty() && curList != null) out.addAll(curList.subList(0, Math.min(15, curList.size())));
         return out;
     }
@@ -999,10 +1072,15 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     // ---------------------------------------------------------------- TV guide
 
     private void openGuide() {
+        if (!prefs.hasLogin()) {
+            Toast.makeText(this, "Add an IPTV account in Settings (⚙) for the TV Guide", Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (cats.isEmpty() || xt == null) {
             Toast.makeText(this, "Guide needs the channel list – still loading", Toast.LENGTH_SHORT).show();
             return;
         }
+        if (ttView.isOpen()) ttView.close();
         hidePanel();
         guide.setVisibility(View.VISIBLE);
         guide.open();
@@ -1051,7 +1129,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                 BezelSet.Layout L = set.layoutFor(glView.getWidth(), glView.getHeight());
                 for (String name : L.controls.keySet()) {
                     RectF r = L.control(name, glView.getWidth(), glView.getHeight());
-                    if (!r.contains(x, y)) continue;
+                    if (r == null || !r.contains(x, y)) continue;
                     if (standby && !name.equals("power")) return true;   // only POWER works in standby
                     wheelRect = r;
                     wheelSteps = 0;
@@ -1083,12 +1161,13 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                     button = null;
                     ui.removeCallbacks(repeat);
                     wheelEnd();
-                    // one-shot buttons act on release (a panel opened on press would be shut by this UP)
-                    if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelRect.contains(x, y)) releaseButton(b);
+                    if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelRect != null && wheelRect.contains(x, y)) {
+                        releaseButton(b);
+                    }
                     return true;
                 }
                 if (wheel == null) return standby;
-                if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelSteps == 0)
+                if (e.getActionMasked() == MotionEvent.ACTION_UP && wheelSteps == 0 && wheelRect != null)
                     wheelStep(y < wheelRect.centerY() ? 1 : -1);
                 wheelEnd();
                 return true;
@@ -1187,6 +1266,8 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                 if (player != null) player.setPlayWhenReady(true);
             } else if (current != null) {
                 play(current);
+            } else if (!prefs.hasLogin()) {
+                showWelcome();
             }
         }
     }
@@ -1195,21 +1276,24 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         return (int) (v * getResources().getDisplayMetrics().density);
     }
 
-    // ---------------------------------------------------------------- films & shows: browser hooks
+    // ---------------------------------------------------------------- films, shows & local videos: browser hooks
 
     private long lastPos;
 
     private void openLibrary(int tab) {
-        if (xt == null && tab != LibraryView.VIDEOS) {
-            Toast.makeText(this, "Still connecting – try again in a moment", Toast.LENGTH_SHORT).show();
+        if (xt == null && tab != LibraryView.VIDEOS && tab != LibraryView.SEARCH) {
+            Toast.makeText(this, prefs.hasLogin() ? "Still connecting – try again in a moment"
+                    : "Add an IPTV account in Settings (⚙) for Films & Shows", Toast.LENGTH_SHORT).show();
             return;
         }
+        if (ttView.isOpen()) ttView.close();
         hidePanel();
         lib.setSource(libKey());
         lib.open(tab);
     }
 
     @Override public Xtream libXtream() { return xt; }
+    @Override public Prefs libPrefs() { return prefs; }
     @Override public String libKey() { return prefs.server() + "|" + prefs.user(); }
     @Override public List<Xtream.Channel> libChannels() { return all; }
     @Override public Vod.Resume libResume() { return resume; }
@@ -1228,7 +1312,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         playVod(p, startMs, false);
     }
 
-    /** TV tab: back to live TV. */
+    /** TV tab: back to live TV (or standby menu if no IPTV login). */
     @Override
     public void libTv() {
         lib.close();
@@ -1236,7 +1320,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         goLive();
     }
 
-    /** Back out of the browser: to the film if one is playing behind it, else live TV (or ES-DE). */
+    /** Back out of the browser: to the film if one is playing behind it, else live TV (or launcher). */
     @Override
     public void libClose() {
         lib.close();
@@ -1253,7 +1337,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         if (vod != null) endVod();
         fromExternal = false;
         if (!prefs.hasLogin()) {
-            startActivity(new Intent(this, SetupActivity.class));
+            showWelcome();
         } else if (xt == null || loadedStamp != prefs.loginStamp()) {
             if (player != null) player.stop();
             loadChannels();
@@ -1263,36 +1347,84 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
     }
 
     @Override
-    public void libAskFiles() {
+    public void libAskMedia() {
+        requestPermissions(new String[]{Local.mediaPermission()}, REQ_MEDIA);
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void libAddFolder() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
         try {
-            startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                    android.net.Uri.parse("package:" + getPackageName())));
+            startActivityForResult(i, REQ_TREE);
         } catch (Exception e) {
-            startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            Toast.makeText(this, "No folder picker available on this device", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    public void libRemoveFolder(String treeUri) {
+        try {
+            getContentResolver().releasePersistableUriPermission(Uri.parse(treeUri), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception ignored) {
+        }
+        prefs.removeTreeUri(treeUri);
+        lib.forgetLocal();
+        lib.refresh();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(req, perms, res);
+        if (req == REQ_MEDIA) {
+            boolean granted = res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED;
+            if (!granted && !shouldShowRequestPermissionRationale(Local.mediaPermission())) {
+                Toast.makeText(this, "Enable video access in Android Settings, or use + Add a folder", Toast.LENGTH_LONG).show();
+            }
+            lib.forgetLocal();
+            lib.refresh();
+        }
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    protected void onActivityResult(int req, int resultCode, Intent data) {
+        super.onActivityResult(req, resultCode, data);
+        if (req == REQ_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri tree = data.getData();
+            try {
+                getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (Exception ignored) {
+            }
+            prefs.addTreeUri(tree.toString());
+            lib.forgetLocal();
+            lib.refresh();
         }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (lib.getVisibility() == View.VISIBLE) {     // e.g. back from the file-access settings page
+        if (lib.getVisibility() == View.VISIBLE) {
             lib.forgetLocal();
             lib.refresh();
         }
     }
 
-    // ---------------------------------------------------------------- your own videos
+    // ---------------------------------------------------------------- external video intents
 
     private Intent pendingView;
-    private boolean fromExternal;       // opened by ES-DE / a file manager: Back returns there
+    private boolean fromExternal;       // opened by a file manager / launcher: Back returns there
     private boolean bezelAuto = true;
 
-    /** Plays a video file handed over by ES-DE (content://) or a file manager. */
+    /** Plays a video file handed over via ACTION_VIEW (content:// or file://). */
     private void handleView() {
         Intent i = pendingView;
         pendingView = null;
         if (i == null || player == null) return;
-        android.net.Uri u = i.getData();
+        Uri u = i.getData();
         String name = null;
         long size = -1;
         try (android.database.Cursor c = getContentResolver().query(u, null, null, null, null)) {
@@ -1305,8 +1437,9 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         } catch (Exception ignored) {
         }
         if (name == null) name = u.getLastPathSegment() == null ? "Video" : u.getLastPathSegment();
-        diag("open " + u.getScheme() + " " + name + " " + size + " path=" + u.getPath());
+        diag("open " + u.getScheme() + " " + name + " " + size);
 
+        if (ttView.isOpen()) ttView.close();
         guide.setVisibility(View.GONE);
         hidePanel();
         lib.close();
@@ -1318,29 +1451,24 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         bezelAuto = bezel == null;
         if (bezel != null) useBezel(bezel);
 
-        // the same file seen through the phone's storage, so the next file in the folder can follow
-        java.io.File f = "file".equals(u.getScheme()) ? new java.io.File(u.getPath())
-                : Local.fileFor(u, name, size);
-        Vod.Playable p;
-        Vod.Playable viaFile = null;
-        if (f != null && f.exists() && Local.hasAccess(this)) {
-            java.io.File dir = f.getParentFile();
-            if (dir != null) viaFile = Local.chain(Local.videos(dir)).get(f.getAbsolutePath());
-        }
-        if (viaFile != null && !"content".equals(u.getScheme())) {
-            p = viaFile;
-        } else {
-            p = Vod.Playable.local(u.toString(), Local.title(name), "", Local.key(name, size));
-            if (viaFile != null) {
-                p.next = viaFile.next;
-                p.fileUri = viaFile.localUri;
-            } else if (f != null) {
-                p.fileUri = android.net.Uri.fromFile(f).toString();
-            }
-        }
+        final Vod.Playable p = Vod.Playable.local(u.toString(), Local.title(name), "", Local.key(name, size));
         long at = resume.pos(p.key());
         playVod(p, at, false);
         if (at > 0) osd("RESUMED " + Vod.clock(at), null, false);
+
+        // Link to sibling files in background if this file sits inside MediaStore or a picked folder
+        final Set<String> trees = prefs.treeUris();
+        io.execute(() -> {
+            Vod.Playable linked = Local.withNext(getApplicationContext(), p, trees);
+            if (linked != null && linked != p) {
+                ui.post(() -> {
+                    if (vod == p) {
+                        p.next = linked.next;
+                        p.fileUri = linked.localUri;
+                    }
+                });
+            }
+        });
     }
 
     /** Switches the bezel for this video only (your saved choice comes back afterwards). */
@@ -1361,6 +1489,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
 
     private void playVod(Vod.Playable p, long startMs, boolean again) {
         if (player == null || (xt == null && !p.isLocal())) return;
+        if (ttView.isOpen()) ttView.close();
         if (vod != null && vod != p) saveVodPos();
         if (vod != null && vod.isLocal() && !p.isLocal()) restoreBezel();
         boolean wasLive = liveOn;
@@ -1424,7 +1553,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         endVod();
         if (player != null) player.stop();
         if (fromExternal && lib.getVisibility() != View.VISIBLE && wasLocal) {
-            finish();                          // back to ES-DE, like quitting RetroArch
+            finish();
             return;
         }
         osd(null, null, false);
@@ -1656,7 +1785,7 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         else showTransport(false);
     }
 
-    // ---------------------------------------------------------------- diagnostics
+    // ---------------------------------------------------------------- diagnostics (debug builds only)
 
     private String tech = "";
 
@@ -1704,25 +1833,34 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
         }
     }
 
-    /** Appends a line to files/diag.log (no URLs or login details). Kept under ~200 KB. */
+    /** Appends a line to files/diag.log in debug builds only (no URLs or login details). */
     private void diag(String line) {
-        try {
-            java.io.File f = new java.io.File(getFilesDir(), "diag.log");
-            if (f.length() > 200_000) f.delete();
-            String ch = current == null ? "-" : current.num + " " + current.name;
-            String s = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(new java.util.Date())
-                    + " [" + ch + "] " + line + "\n";
-            java.nio.file.Files.write(f.toPath(), s.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
-        } catch (Exception ignored) {
-        }
+        if (!debuggable) return;
+        final String ch = current == null ? "-" : current.num + " " + current.name;
+        final java.io.File f = new java.io.File(getFilesDir(), "diag.log");
+        io.execute(() -> {
+            try {
+                if (f.length() > 200_000) f.delete();
+                String s = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(new java.util.Date())
+                        + " [" + ch + "] " + line + "\n";
+                java.nio.file.Files.write(f.toPath(), s.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     // ---------------------------------------------------------------- list adapter
 
     private final class ChannelAdapter extends BaseAdapter {
-        @Override public int getCount() { return curList.size(); }
-        @Override public Object getItem(int i) { return curList.get(i); }
+        @Override public int getCount() {
+            if (cats.isEmpty() && !prefs.hasLogin()) return MENU_NO_IPTV.length;
+            return curList.size();
+        }
+        @Override public Object getItem(int i) {
+            if (cats.isEmpty() && !prefs.hasLogin()) return MENU_NO_IPTV[i];
+            return curList.get(i);
+        }
         @Override public long getItemId(int i) { return i; }
 
         @Override
@@ -1735,8 +1873,13 @@ public class TvActivity extends Activity implements BezelRenderer.Host, GuideVie
                 t.setSingleLine(true);
                 t.setPadding(dp(8), dp(10), dp(8), dp(10));
             }
+            if (cats.isEmpty() && !prefs.hasLogin()) {
+                t.setText(MENU_NO_IPTV[i]);
+                t.setTextColor(i == 0 ? GREEN : i == 1 ? Color.rgb(255, 230, 60) : Color.rgb(220, 220, 220));
+                return t;
+            }
             Xtream.Channel c = curList.get(i);
-            boolean fav = prefs.favs().contains(c.id);
+            boolean fav = favSet.contains(c.id);
             t.setText((fav ? "★ " : "  ") + pad(c.num) + "  " + c.name);
             t.setTextColor(c == current ? GREEN : Color.rgb(220, 220, 220));
             return t;

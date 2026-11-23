@@ -1,4 +1,4 @@
-package com.magicv6.retrotv;
+package io.github.samblakeman.retrotv;
 
 import android.app.Activity;
 import android.graphics.Color;
@@ -13,18 +13,20 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-/** Xtream login form. Details are saved only in this app's private storage on the phone. */
+/** Settings & optional Xtream Codes IPTV login. Details stay in private app storage only. */
 public class SetupActivity extends Activity {
     private EditText server, user, pass, town;
+    private CheckBox hls, softAvc;
+    private TextView status;
+    private Button go, alt;
 
     @Override
     protected void onPause() {
         super.onPause();
-        new Prefs(this).weatherTown(town.getText().toString());   // saved without needing Connect
+        Prefs p = new Prefs(this);
+        p.weatherTown(town.getText().toString());
+        p.softAvcLive(softAvc.isChecked());
     }
-    private CheckBox hls;
-    private TextView status;
-    private Button go;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -37,15 +39,18 @@ public class SetupActivity extends Activity {
         col.setPadding(pad, pad * 2, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Retro TV — IPTV login");
+        title.setText("Retro TV — Settings");
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
         col.addView(title);
 
         TextView note = new TextView(this);
-        note.setText("Your Xtream Codes details from your provider. They are stored only on this phone.");
+        note.setText("Retro TV provides no channels or media. Watch your own local video files and "
+                + "Teletext right away, or sign in with your Xtream Codes IPTV details (stored only on this device).");
+        note.setTextColor(Color.LTGRAY);
         note.setPadding(0, dp(8), 0, dp(16));
         col.addView(note);
 
+        TextView iptvHead = section(col, "IPTV account (optional)", 0);
         server = field(col, "Server (e.g. http://example.com:8080)", p.server(), InputType.TYPE_TEXT_VARIATION_URI);
         user = field(col, "Username", p.user(), InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         pass = field(col, "Password", p.pass(), InputType.TYPE_TEXT_VARIATION_PASSWORD);
@@ -55,28 +60,68 @@ public class SetupActivity extends Activity {
         hls.setChecked(p.hls());
         col.addView(hls);
 
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setPadding(0, dp(8), 0, 0);
+
         go = new Button(this);
         go.setText("Connect");
         go.setOnClickListener(v -> connect());
-        col.addView(go);
+        btnRow.addView(go, new LinearLayout.LayoutParams(0, -2, 1));
+
+        alt = new Button(this);
+        if (p.hasLogin()) {
+            alt.setText("Log out");
+            alt.setOnClickListener(v -> logout());
+        } else {
+            alt.setText("Skip — Local & Teletext");
+            alt.setOnClickListener(v -> {
+                new Prefs(this).skippedLogin(true);
+                finish();
+            });
+        }
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(0, -2, 1);
+        alp.leftMargin = dp(8);
+        btnRow.addView(alt, alp);
+        col.addView(btnRow);
 
         status = new TextView(this);
-        status.setPadding(0, dp(12), 0, 0);
+        status.setPadding(0, dp(10), 0, 0);
         status.setGravity(Gravity.START);
         col.addView(status);
 
-        TextView wx = new TextView(this);
-        wx.setText("Teletext");
-        wx.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        wx.setPadding(0, dp(28), 0, dp(4));
-        col.addView(wx);
-        town = field(col, "Weather town (e.g. Leeds) - blank for London", p.weatherTown(),
+        section(col, "Playback", dp(20));
+        softAvc = new CheckBox(this);
+        softAvc.setText("Software H.264 decoder for live TV");
+        softAvc.setChecked(p.softAvcLive());
+        softAvc.setOnCheckedChangeListener((v, checked) -> new Prefs(this).softAvcLive(checked));
+        col.addView(softAvc);
+
+        TextView avcHint = new TextView(this);
+        avcHint.setText("Turn on if interlaced live TV channels show green/magenta blocks on your phone.");
+        avcHint.setTextColor(Color.GRAY);
+        avcHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        avcHint.setPadding(dp(32), 0, 0, dp(4));
+        col.addView(avcHint);
+
+        section(col, "Teletext", dp(20));
+        town = field(col, "Weather town (e.g. Leeds) — blank for London", p.weatherTown(),
                 InputType.TYPE_TEXT_VARIATION_POSTAL_ADDRESS);
 
         ScrollView sv = new ScrollView(this);
         sv.setFitsSystemWindows(true);
         sv.addView(col);
         setContentView(sv);
+        if (iptvHead != null) iptvHead.setTextColor(Color.WHITE);
+    }
+
+    private TextView section(LinearLayout col, String label, int topPad) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19);
+        t.setPadding(0, topPad, 0, dp(4));
+        col.addView(t);
+        return t;
     }
 
     private EditText field(LinearLayout col, String hint, String value, int variation) {
@@ -87,6 +132,17 @@ public class SetupActivity extends Activity {
         e.setText(value);
         col.addView(e);
         return e;
+    }
+
+    private void logout() {
+        new Prefs(this).clearLogin();
+        server.setText("");
+        user.setText("");
+        pass.setText("");
+        status.setTextColor(Color.rgb(120, 230, 140));
+        status.setText("IPTV account removed. Press Back or Skip to use local videos & Teletext.");
+        alt.setText("Skip — Local & Teletext");
+        alt.setOnClickListener(v -> finish());
     }
 
     private void connect() {
